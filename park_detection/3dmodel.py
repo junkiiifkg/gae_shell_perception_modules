@@ -7,6 +7,7 @@ from ultralytics import YOLO
 import cv2
 import torch
 import numpy as np
+from gae_msgs.msg import GaeShellPolygon
 
 class ZedYoloNode(Node):
     def __init__(self):
@@ -29,7 +30,7 @@ class ZedYoloNode(Node):
         )
         
         # 4. Publisher (Park Alanı Poligonu)
-        self.poly_pub = self.create_publisher(PolygonStamped, '/parking_area/polygon', 10)
+        self.poly_pub = self.create_publisher(GaeShellPolygon, '/parking_area/polygon', 10)
 
         self.get_logger().info("YOLO Detector Hazır (Approx Kapalı). Topic: /parking_area/polygon")
 
@@ -56,6 +57,12 @@ class ZedYoloNode(Node):
             best_mask_data = result.masks.xy[best_index]
             
             # --- POLIGON MESAJINI OLUŞTUR VE YAYINLA ---
+            GaeShellPolygon_msg = GaeShellPolygon()
+            GaeShellPolygon_msg.header.stamp = self.get_clock().now().to_msg()
+            GaeShellPolygon_msg.header.frame_id = "zed2_left_camera_optical_frame"
+            GaeShellPolygon_msg.confidence = float(scores[best_index].item())
+            if GaeShellPolygon_msg.confidence < 0.75:
+                return  # Güven skoru düşükse yayınlama
             poly_msg = PolygonStamped()
             poly_msg.header.stamp = self.get_clock().now().to_msg()
             
@@ -73,17 +80,14 @@ class ZedYoloNode(Node):
                 point_msg.y = float(p[1]) 
                 point_msg.z = 0.0
                 poly_msg.polygon.points.append(point_msg)
+            
+            GaeShellPolygon_msg.polygon = poly_msg
 
-            self.poly_pub.publish(poly_msg)
+            self.poly_pub.publish(GaeShellPolygon_msg)
             
             # Görselleştirme: Tüm noktaları çiz (Sarı çizgi)
             cv2.polylines(annotated_frame, [points], True, (0, 255, 255), 2)
 
-        # Sonucu Göster
-        cv2.imshow("ZED YOLO Park Tespiti", annotated_frame)
-        key = cv2.waitKey(1)
-        if key == ord('q'):
-            rclpy.shutdown()
 
 def main(args=None):
     rclpy.init(args=args)
