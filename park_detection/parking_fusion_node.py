@@ -32,18 +32,29 @@ class ParkingArea3D(Node):
         # --- Parking Area Polygon & Confidence ---
         self.parking_poly_np = None
         self.parking_mask = None
-        self.current_confidence = 0.0  # Confidence skorunu saklamak için değişken
+        self.current_confidence = 0.0
         
         # --- Orientation Smoothing ---
         self.prev_yaw = None
         self.yaw_history = []
-        self.max_history_size = 5  # Reduced from 10 for faster response
-        self.yaw_change_threshold = np.pi / 4  # 45 degrees - more tolerant than 30
+        self.max_history_size = 5
+        self.yaw_change_threshold = np.pi / 3  # 60 degrees - more tolerant for side approaches
         
-        # --- Orientation Locking ---
-        self.locked_pose_map = None  # Store locked pose in MAP frame (world coordinates)
-        self.lock_distance_threshold = 8.0  # FREEZE ZONE: lock at 8m
-        self.is_locked = False
+        # --- Position Locking (orientation stays dynamic) ---
+        self.locked_position_map = None  # Only lock position, not orientation
+        self.lock_distance_threshold = 8.0
+        self.is_position_locked = False
+        
+        # --- ORIENTATION OFFSET ---
+        # Manuel düzeltme için: 0, 90, -90, 180 derece deneyin
+        self.declare_parameter('orientation_offset_degrees', 0.0)
+        self.orientation_offset = np.radians(
+            self.get_parameter('orientation_offset_degrees').value
+        )
+        
+        # PCA eksen seçimi: 'major' veya 'minor'
+        self.declare_parameter('pca_axis', 'minor')  # 'major' veya 'minor'
+        self.pca_axis_mode = self.get_parameter('pca_axis').value
 
         # --- TF Buffer ---
         self.tf_buffer = tf2_ros.Buffer()
@@ -56,8 +67,8 @@ class ParkingArea3D(Node):
             self.camera_info_cb,
             10
         )
+        self.pose_debug_pub = self.create_publisher(PoseStamped, "/parking_area/pose_debug", 10)
         
-        # [GÜNCELLEME 1] Artık PolygonStamped yerine GaeShellPolygon dinliyoruz
         self.create_subscription(
             GaeShellPolygon,
             "/parking_area/polygon",
@@ -65,8 +76,6 @@ class ParkingArea3D(Node):
             10
         )
         
-
-        # [GÜNCELLEME 2] Publisher tipi GaeCamShellDetection olarak değiştirildi
         self.center_pose_pub = self.create_publisher(
             GaeCamShellDetection,
             "/parking_area/center_pose",
@@ -96,7 +105,10 @@ class ParkingArea3D(Node):
             5
         )
         self.get_logger().info(
-            "3D Parking Area Node (CuPy Accelerated) started with Confidence support."
+            f"3D Parking Area Node started with:\n"
+            f"  - PCA Axis: {self.pca_axis_mode}\n"
+            f"  - Orientation Offset: {np.degrees(self.orientation_offset):.1f}°\n"
+            f"  - Lock Distance: {self.lock_distance_threshold}m"
         )
 
     def camera_info_cb(self, msg: CameraInfo):
@@ -109,13 +121,9 @@ class ParkingArea3D(Node):
             self.height = msg.height
             self.is_initialized = True
 
-    # [GÜNCELLEME 3] Callback artık GaeShellPolygon alıyor
     def polygon_cb(self, msg: GaeShellPolygon):
-        # Confidence skorunu sakla
         self.current_confidence = msg.confidence
         
-        # İçerideki PolygonStamped mesajına erişim: msg.polygon
-        # Onun içindeki noktalara erişim: msg.polygon.polygon.points
         points = np.array(
             [[point.x, point.y] for point in msg.polygon.polygon.points],
             dtype=np.int32
@@ -134,13 +142,13 @@ class ParkingArea3D(Node):
         # 1. TF LOOKUPS
         try:
             T_lidar_to_cam = self.tf_buffer.lookup_transform(
-                "zed2_left_camera_optical_frame", "ouster", rclpy.time.Time()
+                "zed_left_camera_optical_frame", "ouster", rclpy.time.Time()
             )
             T_lidar_to_base = self.tf_buffer.lookup_transform(
                 "base_link", "ouster", rclpy.time.Time()
             )
             T_cam_to_lidar = self.tf_buffer.lookup_transform(
-                "ouster", "zed2_left_camera_optical_frame", rclpy.time.Time()
+                "ouster", "zed_left_camera_optical_frame", rclpy.time.Time()
             )
         except Exception as e:
             self.get_logger().warn(f"TF lookup failed: {e}")
@@ -167,16 +175,15 @@ class ParkingArea3D(Node):
                                 T_lidar_to_base.transform.translation.y,
                                 T_lidar_to_base.transform.translation.z])
         
-        # --- PART 1: FILTERING POINTS ---
+        # --- POINT FILTERING PIPELINE ---
         points_cam_gpu = points_lidar_gpu @ R_l2c_gpu.T + t_l2c_gpu
 
         X = points_cam_gpu[:, 0]
         Y = points_cam_gpu[:, 1]
         Z = points_cam_gpu[:, 2]
 
-        valid_z_mask = Z > 0.0
+        valid_z_mask = Z > -0.5
 
-        # Perspective correction
         Z_safe = cp.maximum(Z, 0.1)
         u = (self.fx * (X / Z_safe) + self.cx).astype(cp.int32)
         v = (self.fy * (Y / Z_safe) + self.cy).astype(cp.int32)
@@ -190,14 +197,8 @@ class ParkingArea3D(Node):
         if valid_indices.size == 0:
             return
 
-        u_valid = u[valid_indices]
-        v_valid = v[valid_indices]
+        candidates_indices = valid_indices 
 
-        # 2D mask check
-        in_poly_2d_mask = self.parking_mask[v_valid, u_valid] > 0
-        
-        candidates_indices = valid_indices[in_poly_2d_mask]
-        
         if candidates_indices.size == 0:
             return
             
@@ -236,7 +237,7 @@ class ParkingArea3D(Node):
         if points_base_ground.shape[0] < 10:
             points_base_ground = points_base_gpu
 
-        # --- PART 2: CENTER CALCULATION ---
+        # --- CENTER & ORIENTATION CALCULATION ---
         poly_center_gpu = cp.mean(points_base_ground, axis=0)
         poly_center = cp.asnumpy(poly_center_gpu)
         
@@ -259,28 +260,37 @@ class ParkingArea3D(Node):
         return R
 
     def publish_center_pose_map(self, p_base, points_base_ground=None):
-        """Park alanı merkezini ve oryantasyonunu yayınla"""
+        """Publish parking center with DYNAMIC orientation but optionally locked position"""
         
-        # Calculate distance to parking spot (p_base is in base_link frame, vehicle is at origin)
+        # Calculate distance to parking spot
         distance_to_spot = np.sqrt(p_base[0]**2 + p_base[1]**2)
         
-        # Calculate current orientation and position
+        # ALWAYS calculate current orientation dynamically from point cloud
         raw_yaw = self.calculate_orientation_pca(points_base_ground)
         smoothed_yaw = self.smooth_orientation(raw_yaw)
         
-        # Create pose in base_link frame
+        # Create pose in base_link frame with DYNAMIC orientation
         pose_base = Pose()
         pose_base.position.x = float(p_base[0])
         pose_base.position.y = float(p_base[1])
         pose_base.position.z = float(p_base[2])
+        
+        # Use the calculated orientation
         quat = self.yaw_to_quaternion(smoothed_yaw)
         pose_base.orientation.x = quat[0]
         pose_base.orientation.y = quat[1]
         pose_base.orientation.z = quat[2]
         pose_base.orientation.w = quat[3]
+
+        # Debug pose in base_link
+        pose_stamped_base = PoseStamped()
+        pose_stamped_base.header.frame_id = "base_link"
+        pose_stamped_base.header.stamp = self.get_clock().now().to_msg()
+        pose_stamped_base.pose = pose_base
+        self.pose_debug_pub.publish(pose_stamped_base)
         
         try:
-            # Transform to MAP frame (world coordinates)
+            # Transform to MAP frame
             T_base_to_map = self.tf_buffer.lookup_transform(
                 "map", "base_link", rclpy.time.Time()
             )
@@ -289,37 +299,38 @@ class ParkingArea3D(Node):
             self.get_logger().warn(f"TF base_link->map failed: {e}")
             return
         
-        # FREEZE ZONE: Lock pose in MAP frame when within 8 meters
+        # POSITION LOCKING (orientation remains dynamic)
         if distance_to_spot < self.lock_distance_threshold:
-            if not self.is_locked:
-                # First time entering freeze zone - lock the MAP frame pose
-                self.locked_pose_map = pose_map
-                self.is_locked = True
-                self.get_logger().info(f"🔒 FREEZE ZONE: Locked at {distance_to_spot:.2f}m in MAP frame")
+            if not self.is_position_locked:
+                # Lock ONLY the position in MAP frame
+                self.locked_position_map = [
+                    pose_map.position.x,
+                    pose_map.position.y,
+                    pose_map.position.z
+                ]
+                self.is_position_locked = True
+                self.get_logger().info(f"🔒 POSITION LOCKED at {distance_to_spot:.2f}m (orientation stays dynamic)")
             
-            # Use locked pose (in MAP frame - doesn't move with car!)
-            pose_to_publish = self.locked_pose_map
+            # Use locked position but current orientation
+            pose_to_publish = Pose()
+            pose_to_publish.position.x = self.locked_position_map[0]
+            pose_to_publish.position.y = self.locked_position_map[1]
+            pose_to_publish.position.z = self.locked_position_map[2]
+            pose_to_publish.orientation = pose_map.orientation  # Dynamic!
         else:
-            # Far from spot - update normally
-            if self.is_locked:
-                self.get_logger().info(f"🔓 FREEZE ZONE RELEASED (distance: {distance_to_spot:.2f}m)")
-                self.is_locked = False
-                self.locked_pose_map = None
+            # Far from spot - everything updates normally
+            if self.is_position_locked:
+                self.get_logger().info(f"🔓 POSITION UNLOCKED (distance: {distance_to_spot:.2f}m)")
+                self.is_position_locked = False
+                self.locked_position_map = None
             
             pose_to_publish = pose_map
         
-        # Publish the pose
+        # Publish final pose
         pose_msg = PoseStamped()
         pose_msg.header.frame_id = "map"
         pose_msg.header.stamp = self.get_clock().now().to_msg()
         pose_msg.pose = pose_to_publish
-        #         pose_msg.pose.position.x = 33961.55859375
-        # pose_msg.pose.position.y = 22.698162078857422
-        # pose_msg.pose.position.z = 0.0    
-        # pose_msg.pose.orientation.x = 0.0
-        # pose_msg.pose.orientation.y = 0.0
-        # pose_msg.pose.orientation.z = -0.008741608823815417
-        # pose_msg.pose.orientation.w = 0.9999617914076374
 
         detection_msg = GaeCamShellDetection()
         detection_msg.center_pose = pose_msg
@@ -327,9 +338,17 @@ class ParkingArea3D(Node):
         detection_msg.header = pose_msg.header
 
         self.center_pose_pub.publish(detection_msg)
+        
+        # Log final orientation
+        yaw_deg = np.degrees(smoothed_yaw)
+        self.get_logger().info(
+            f"📍 Final Orientation: {yaw_deg:.1f}° | Distance: {distance_to_spot:.2f}m | "
+            f"Locked: {self.is_position_locked}",
+            throttle_duration_sec=1.0
+        )
 
     def yaw_to_quaternion(self, yaw):
-        """Yaw açısını quaternion'a çevir (sadece z ekseni etrafında)"""
+        """Convert yaw angle to quaternion (rotation around z-axis)"""
         return [
             0.0,  # x
             0.0,  # y
@@ -337,34 +356,61 @@ class ParkingArea3D(Node):
             np.cos(yaw / 2.0)   # w
         ]
         
-        
     def calculate_orientation_pca(self, points_base_ground):
-        """PCA ile park alanının yönünü hesapla"""
-        points_cpu = cp.asnumpy(points_base_ground[:, :2])  # Sadece x,y
+        """Calculate parking area orientation using PCA on ground points"""
+        points_cpu = cp.asnumpy(points_base_ground[:, :2])  # Only x,y
         
         if points_cpu.shape[0] < 10:
-            # Not enough points, return previous or default
             return self.prev_yaw if self.prev_yaw is not None else 0.0
         
-        # Merkeze göre normalize et
+        # Center the points
         centered = points_cpu - np.mean(points_cpu, axis=0)
         
-        # Covariance matrix ve eigenvalue/eigenvector
+        # Covariance matrix and eigenvector analysis
         cov_matrix = np.cov(centered.T)
         eigenvalues, eigenvectors = np.linalg.eig(cov_matrix)
         
-        # En büyük eigenvalue'ya karşılık gelen eigenvector = ana yön
-        main_direction = eigenvectors[:, np.argmax(eigenvalues)]
+        # Sort eigenvalues and eigenvectors (largest first)
+        idx = eigenvalues.argsort()[::-1]
+        eigenvalues = eigenvalues[idx]
+        eigenvectors = eigenvectors[:, idx]
         
-        # Yaw açısını hesapla
-        yaw = np.arctan2(main_direction[1], main_direction[0])
+        # Calculate aspect ratio for debugging
+        aspect_ratio = eigenvalues[0] / (eigenvalues[1] + 1e-6)
         
-        # PCA gives ambiguous direction (180 degree ambiguity)
-        # Choose the one closer to previous orientation if available
+        # Select axis based on parameter
+        if self.pca_axis_mode == 'minor':
+            # Use minor axis (second eigenvector - perpendicular to spread)
+            direction = eigenvectors[:, 1]
+            axis_name = "MINOR (perpendicular)"
+        else:
+            # Use major axis (first eigenvector - along spread)
+            direction = eigenvectors[:, 0]
+            axis_name = "MAJOR (parallel)"
+        
+        # Calculate yaw angle from selected direction
+        yaw = np.arctan2(direction[1], direction[0])
+        
+        # Apply manual offset
+        yaw = self.normalize_angle(yaw + self.orientation_offset)
+        
+        # Debug info
+        self.get_logger().info(
+            f"PCA: {axis_name} | Ratio: {aspect_ratio:.2f} | "
+            f"Raw yaw: {np.degrees(yaw - self.orientation_offset):.1f}° | "
+            f"Offset: {np.degrees(self.orientation_offset):.1f}° | "
+            f"Final: {np.degrees(yaw):.1f}°",
+            throttle_duration_sec=2.0
+        )
+        
+        # Resolve 180-degree ambiguity using previous orientation
         if self.prev_yaw is not None:
             yaw_alt = yaw + np.pi if yaw < 0 else yaw - np.pi
-            if abs(self.normalize_angle(yaw - self.prev_yaw)) > abs(self.normalize_angle(yaw_alt - self.prev_yaw)):
+            diff1 = abs(self.normalize_angle(yaw - self.prev_yaw))
+            diff2 = abs(self.normalize_angle(yaw_alt - self.prev_yaw))
+            if diff2 < diff1:
                 yaw = yaw_alt
+                self.get_logger().info("180° flip applied", throttle_duration_sec=3.0)
         
         return yaw
     
@@ -377,32 +423,31 @@ class ParkingArea3D(Node):
         return angle
     
     def smooth_orientation(self, new_yaw):
-        """Smooth orientation changes using moving average and jump detection"""
+        """Smooth orientation using circular moving average with jump detection"""
         
-        # First call initialization
         if self.prev_yaw is None:
             self.prev_yaw = new_yaw
             self.yaw_history.append(new_yaw)
             return new_yaw
         
-        # Normalize the difference
+        # Check for large jumps
         diff = self.normalize_angle(new_yaw - self.prev_yaw)
         
-        # Detect large jumps and ignore them
         if abs(diff) > self.yaw_change_threshold:
-            self.get_logger().warn(f"Large orientation jump detected: {np.degrees(diff):.1f} degrees, ignoring")
+            self.get_logger().warn(
+                f"⚠️ Large orientation jump: {np.degrees(diff):.1f}° - ignoring",
+                throttle_duration_sec=2.0
+            )
             return self.prev_yaw
         
         # Add to history
         self.yaw_history.append(new_yaw)
         
-        # Keep history size limited
         if len(self.yaw_history) > self.max_history_size:
             self.yaw_history.pop(0)
         
-        # Circular mean for angles
+        # Circular mean for angles (proper averaging for angles)
         if len(self.yaw_history) > 1:
-            # Convert to unit vectors, average, then back to angle
             sin_sum = sum(np.sin(y) for y in self.yaw_history)
             cos_sum = sum(np.cos(y) for y in self.yaw_history)
             smoothed_yaw = np.arctan2(sin_sum, cos_sum)
@@ -411,30 +456,6 @@ class ParkingArea3D(Node):
         
         self.prev_yaw = smoothed_yaw
         return smoothed_yaw
-    
-    
-    def calculate_orientation_from_polygon(self):
-        """Poligonun en uzun kenarından yön hesapla"""
-        poly = self.parking_poly_np
-        
-        max_length = 0
-        best_edge = None
-        
-        # En uzun kenarı bul
-        for i in range(len(poly)):
-            p1 = poly[i]
-            p2 = poly[(i + 1) % len(poly)]
-            length = np.linalg.norm(p2 - p1)
-            
-            if length > max_length:
-                max_length = length
-                best_edge = (p1, p2)
-        
-        # Kenar vektöründen yaw hesapla
-        edge_vec = best_edge[1] - best_edge[0]
-        yaw = np.arctan2(edge_vec[1], edge_vec[0])
-        
-        return yaw
 
 def main(args=None):
     rclpy.init(args=args)

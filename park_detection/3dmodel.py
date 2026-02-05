@@ -9,6 +9,8 @@ import torch
 import numpy as np
 from gae_msgs.msg import GaeShellPolygon
 
+Debug = False  # Debug görselleştirme için
+
 class ZedYoloNode(Node):
     def __init__(self):
         super().__init__('zed_yolo_detector')
@@ -26,9 +28,10 @@ class ZedYoloNode(Node):
             Image,
             '/zed2_left_camera/image_raw',
             self.image_callback,
+
             10
         )
-        
+        self.debug_pub = self.create_publisher(Image, "/yolo/annotated", 10)
         # 4. Publisher (Park Alanı Poligonu)
         self.poly_pub = self.create_publisher(GaeShellPolygon, '/parking_area/polygon', 10)
 
@@ -87,6 +90,11 @@ class ZedYoloNode(Node):
             
             # Görselleştirme: Tüm noktaları çiz (Sarı çizgi)
             cv2.polylines(annotated_frame, [points], True, (0, 255, 255), 2)
+
+            if Debug:
+                debug_msg = self.bridge.cv2_to_imgmsg(annotated_frame, encoding="bgr8")
+                debug_msg.header = msg.header  # zaman & frame aynı kalsın
+                self.debug_pub.publish(debug_msg)
 
 
 def main(args=None):
