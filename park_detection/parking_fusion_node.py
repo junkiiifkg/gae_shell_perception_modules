@@ -54,7 +54,7 @@ class ParkingArea3D(Node):
         
         # PCA eksen seçimi: 'major' veya 'minor'
         self.declare_parameter('pca_axis', 'minor')  # 'major' veya 'minor'
-        self.pca_axis_mode = self.get_parameter('pca_axis').value
+        self.pca_axis_mode = 'major'
 
         # --- TF Buffer ---
         self.tf_buffer = tf2_ros.Buffer()
@@ -121,6 +121,25 @@ class ParkingArea3D(Node):
             self.height = msg.height
             self.is_initialized = True
 
+    def compute_center_xy_minarearect(self, points_base_ground):
+        pts = cp.asnumpy(points_base_ground[:, :2]).astype(np.float32)
+        if pts.shape[0] < 20:
+            return None
+
+        # outlier kırp (median etrafı)
+        med = np.median(pts, axis=0)
+        d = np.linalg.norm(pts - med, axis=1)
+        thr = np.percentile(d, 70)  # 70-80 arası denenir
+        pts = pts[d < thr]
+        if pts.shape[0] < 20:
+            return None
+
+        hull = cv2.convexHull(pts)  # (N,1,2)
+        rect = cv2.minAreaRect(hull)  # ((cx,cy),(w,h),angle)
+        (cx, cy), (w, h), ang = rect
+        return float(cx), float(cy)
+
+
     def polygon_cb(self, msg: GaeShellPolygon):
         self.current_confidence = msg.confidence
         
@@ -151,7 +170,7 @@ class ParkingArea3D(Node):
                 "ouster", "zed_left_camera_optical_frame", rclpy.time.Time()
             )
         except Exception as e:
-            self.get_logger().warn(f"TF lookup failed: {e}")
+            # self.get_logger().warn(f"TF lookup failed: {e}")
             return
 
         # 2. DATA PREPARATION
@@ -190,14 +209,31 @@ class ParkingArea3D(Node):
 
         in_bounds_mask = (u >= 0) & (u < self.width) & (v >= 0) & (v < self.height)
         
+        # final_candidate_mask = valid_z_mask & in_bounds_mask
+        
+        # valid_indices = cp.where(final_candidate_mask)[0]
+        
+        # if valid_indices.size == 0:
+        #     return
+
+        # candidates_indices = valid_indices 
+
         final_candidate_mask = valid_z_mask & in_bounds_mask
-        
-        valid_indices = cp.where(final_candidate_mask)[0]
-        
-        if valid_indices.size == 0:
+        cand_idx = cp.where(final_candidate_mask)[0]
+        if cand_idx.size == 0:
             return
 
-        candidates_indices = valid_indices 
+        # u,v değerlerini candidate indekslerine indir
+        u_c = u[final_candidate_mask]
+        v_c = v[final_candidate_mask]
+
+        # maskeden oku (v,u!)
+        mask_vals = self.parking_mask[v_c, u_c]  # cupy array
+        in_poly_mask = mask_vals > 0
+
+        candidates_indices = cand_idx[in_poly_mask]
+
+
 
         if candidates_indices.size == 0:
             return
@@ -238,8 +274,14 @@ class ParkingArea3D(Node):
             points_base_ground = points_base_gpu
 
         # --- CENTER & ORIENTATION CALCULATION ---
-        poly_center_gpu = cp.mean(points_base_ground, axis=0)
-        poly_center = cp.asnumpy(poly_center_gpu)
+        xy = self.compute_center_xy_minarearect(points_base_ground)
+        if xy is not None:
+            cx, cy = xy
+            cz = float(cp.median(points_base_ground[:, 2]))  # z için median daha stabil
+            poly_center = np.array([cx, cy, cz], dtype=np.float32)
+        else:
+            poly_center_gpu = cp.mean(points_base_ground, axis=0)
+            poly_center = cp.asnumpy(poly_center_gpu)
         
         # Publish Debug Point
         center_point = Point()
@@ -296,7 +338,7 @@ class ParkingArea3D(Node):
             )
             pose_map = do_transform_pose(pose_base, T_base_to_map)
         except Exception as e:
-            self.get_logger().warn(f"TF base_link->map failed: {e}")
+            # self.get_logger().warn(f"TF base_link->map failed: {e}")
             return
         
         # POSITION LOCKING (orientation remains dynamic)
@@ -434,10 +476,10 @@ class ParkingArea3D(Node):
         diff = self.normalize_angle(new_yaw - self.prev_yaw)
         
         if abs(diff) > self.yaw_change_threshold:
-            self.get_logger().warn(
-                f"⚠️ Large orientation jump: {np.degrees(diff):.1f}° - ignoring",
-                throttle_duration_sec=2.0
-            )
+            # self.get_logger().warn(
+            #     f"⚠️ Large orientation jump: {np.degrees(diff):.1f}° - ignoring",
+            #     throttle_duration_sec=2.0
+            # )
             return self.prev_yaw
         
         # Add to history
